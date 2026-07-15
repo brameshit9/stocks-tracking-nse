@@ -120,6 +120,7 @@ if auto_refresh and st.session_state.last_run is not None:
 # ─────────────────────────────────────────────────────────────
 if should_scan:
     nse = get_session()
+    st.session_state.nse_session_ref = nse
     symbols = cached_symbol_list(nse)
 
     progress = st.progress(0.0, text="Starting live scan...")
@@ -226,16 +227,22 @@ else:
     c4.metric("⚠️ No data", len(nodata))
 
     if len(nodata) == len(results):
+        nse_dbg = st.session_state.get("nse_session_ref")
+        last_err = getattr(nse_dbg, "last_error", None) if nse_dbg else None
+        using_cffi = getattr(nse_dbg, "using_curl_cffi", None) if nse_dbg else None
         st.error(
-            "All 50 symbols came back with **No data**. This isn't the styling bug — "
-            "it means `fetch_live_quote` / `fetch_intraday_series` in `nse_data.py` "
-            "returned `None` for every symbol. Common causes: NSE blocked/rate-limited "
-            "this server's IP (very common on Streamlit Community Cloud, since NSE's "
-            "anti-bot checks often block cloud/datacenter IP ranges), the session's "
-            "cookies weren't set up correctly (NSE requires visiting the homepage first "
-            "to get cookies before hitting the API endpoints), or NSE changed its "
-            "endpoint/response shape. Check the 'Manage app' logs for the actual "
-            "exception being swallowed inside `fetch_live_quote`/`fetch_intraday_series`."
+            "All symbols came back with **No data**. This means NSE's endpoints "
+            "aren't returning usable responses -- most likely because NSE is "
+            "blocking this server's IP (common on cloud hosts like Streamlit "
+            "Community Cloud) and/or fingerprinting the HTTP client's TLS "
+            "handshake.\n\n"
+            f"**Last recorded error:** `{last_err or 'none captured'}`\n\n"
+            f"**Using curl_cffi (TLS impersonation):** {using_cffi}\n\n"
+            + ("" if using_cffi else
+               "`curl_cffi` isn't installed, so requests are going out with "
+               "Python's default TLS fingerprint, which NSE's bot protection "
+               "often blocks outright. Add `curl_cffi` to requirements.txt and "
+               "redeploy -- see the comments at the top of `nse_data.py`.")
         )
 
     tab_summary, tab_bull, tab_bear, tab_all = st.tabs(
