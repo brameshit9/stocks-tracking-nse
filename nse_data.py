@@ -28,14 +28,50 @@ the current live market, not yesterday's close.
 `fetch_daily_history` (daily OHLCV + VWAP) is kept as a fallback for
 after-hours use or historical charting, but the live functions are what the
 app now uses for screening.
+
+IMPORTANT — about "No data" for every symbol
+----------------------------------------------
+NSE sits behind Akamai bot-protection that is known to hard-block requests
+from cloud/datacenter IP ranges (AWS, GCP, Azure — which is what most free
+hosts, including Streamlit Community Cloud, run on), *and* separately
+fingerprints the TLS handshake of the HTTP client. Python's stock
+`requests` library has a different TLS fingerprint than a real Chrome
+browser, so even a perfect cookie warm-up and perfect headers can still get
+silently rejected by NSE when run from a server (this is a known, common
+issue for anyone scraping NSE from a hosted app rather than a home IP).
+
+This version:
+    1. Tracks *why* a call failed (`NSESession.last_error`) instead of
+       silently returning None, so you can see actual status codes.
+    2. Uses `curl_cffi` (which impersonates a real Chrome TLS fingerprint)
+       if it's installed, since that's the standard workaround for
+       Akamai/Cloudflare-style bot walls. Falls back to plain `requests`
+       if `curl_cffi` isn't available.
+
+If you still get "No data" for everything after this fix, it almost
+certainly means NSE is blocking the IP of whatever server you're deployed
+on — at that point the fix is infra-level (e.g. running from a non-cloud
+IP, or routing through a residential/rotating proxy), not code-level.
 """
 
 import time
 import random
 import datetime
 
-import requests
 import pandas as pd
+
+# Prefer curl_cffi (real browser TLS fingerprint) if available — this is
+# the standard fix for Akamai/Cloudflare bot walls that plain `requests`
+# gets silently blocked by. Falls back to `requests` if not installed.
+try:
+    from curl_cffi import requests as _http
+    _HAS_CURL_CFFI = True
+except ImportError:  # pragma: no cover
+    import requests as _http
+    _HAS_CURL_CFFI = False
+
+import requests as _requests_utils  # only used for requests.utils.quote
+
 
 # ─────────────────────────────────────────────────────────────
 #  NSE SESSION — cookie warm-up, headers, retry/backoff
@@ -46,16 +82,29 @@ class NSESession:
         "User-Agent": ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
                         "AppleWebKit/537.36 (KHTML, like Gecko) "
                         "Chrome/124.0.0.0 Safari/537.36"),
-        "Accept": "*/*",
+        "Accept": "application/json, text/plain, */*",
         "Accept-Language": "en-US,en;q=0.9",
         "Accept-Encoding": "gzip, deflate, br",
         "Connection": "keep-alive",
         "Referer": "https://www.nseindia.com/get-quotes/equity?symbol=RELIANCE",
+        "sec-ch-ua": '"Chromium";v="124", "Google Chrome";v="124", "Not-A.Brand";v="99"',
+        "sec-ch-ua-mobile": "?0",
+        "sec-ch-ua-platform": '"Windows"',
+        "sec-fetch-dest": "empty",
+        "sec-fetch-mode": "cors",
+        "sec-fetch-site": "same-origin",
     }
 
     def __init__(self):
-        self.session = requests.Session()
+        if _HAS_CURL_CFFI:
+            self.session = _http.Session(impersonate="chrome124")
+        else:
+            self.session = _http.Session()
         self.session.headers.update(self.HEADERS)
+        # Populated with the most recent failure reason(s), so callers /
+        # the UI can surface *why* things failed instead of a silent None.
+        self.last_error: str | None = None
+        self.using_curl_cffi = _HAS_CURL_CFFI
         self._warm()
 
     def _warm(self):
@@ -63,22 +112,27 @@ class NSESession:
             self.session.get(self.BASE, timeout=10)
             time.sleep(0.4)
             self.session.get(self.BASE + "/get-quotes/equity?symbol=RELIANCE", timeout=10)
-        except Exception:
-            pass
+        except Exception as exc:
+            self.last_error = f"warm-up failed: {exc!r}"
 
     def get_json(self, url, retries=3):
+        last_exc = None
         for attempt in range(retries):
             try:
                 resp = self.session.get(url, timeout=12)
                 if resp.status_code == 200:
                     try:
                         return resp.json()
-                    except ValueError:
-                        pass
+                    except ValueError as exc:
+                        last_exc = f"200 OK but not valid JSON ({exc})"
+                else:
+                    last_exc = f"HTTP {resp.status_code} from {url}"
                 self._warm()
                 time.sleep(1.5 + attempt + random.random())
-            except Exception:
+            except Exception as exc:
+                last_exc = f"{type(exc).__name__}: {exc}"
                 time.sleep(1.5 + attempt + random.random())
+        self.last_error = last_exc
         return None
 
 
@@ -117,7 +171,7 @@ def fetch_live_quote(nse: NSESession, symbol: str) -> dict | None:
     straight from NSE's quote-equity endpoint. Updates continuously during
     market hours (VWAP = cumulative turnover / cumulative volume so far today).
     """
-    url = f"{NSESession.BASE}/api/quote-equity?symbol={requests.utils.quote(symbol)}"
+    url = f"{NSESession.BASE}/api/quote-equity?symbol={_requests_utils.utils.quote(symbol)}"
     data = nse.get_json(url)
     if not data:
         return None
@@ -128,6 +182,7 @@ def fetch_live_quote(nse: NSESession, symbol: str) -> dict | None:
     last_price = price_info.get("lastPrice")
     vwap = price_info.get("vwap")
     if last_price is None or vwap is None:
+        nse.last_error = f"{symbol}: response OK but missing lastPrice/vwap fields"
         return None
 
     return {
@@ -153,7 +208,7 @@ def fetch_intraday_series(nse: NSESession, symbol: str) -> pd.DataFrame | None:
     """
     url = (
         f"{NSESession.BASE}/api/chart-databyindex"
-        f"?index={requests.utils.quote(symbol + 'EQN')}&indices=false"
+        f"?index={_requests_utils.utils.quote(symbol + 'EQN')}&indices=false"
     )
     payload = nse.get_json(url)
     if not payload:
@@ -161,6 +216,7 @@ def fetch_intraday_series(nse: NSESession, symbol: str) -> pd.DataFrame | None:
 
     points = payload.get("grapthData") or payload.get("graphData")
     if not points:
+        nse.last_error = f"{symbol}: response OK but no grapthData/graphData field"
         return None
 
     df = pd.DataFrame(points, columns=["ts", "price"])
@@ -191,7 +247,7 @@ def fetch_daily_history(nse: NSESession, symbol: str, days: int) -> pd.DataFrame
 
     url = (
         f"{NSESession.BASE}/api/historical/cm/equity"
-        f"?symbol={requests.utils.quote(symbol)}"
+        f"?symbol={_requests_utils.utils.quote(symbol)}"
         f"&series=[%22EQ%22]"
         f"&from={from_date.strftime('%d-%m-%Y')}"
         f"&to={to_date.strftime('%d-%m-%Y')}"
