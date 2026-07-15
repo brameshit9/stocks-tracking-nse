@@ -185,6 +185,27 @@ def plot_stock(symbol: str, series: pd.DataFrame, live_vwap: float, ltp: float):
     st.plotly_chart(fig, use_container_width=True)
 
 
+def style_results(df: pd.DataFrame):
+    """Apply row highlighting on the Signal column.
+
+    pandas removed Styler.applymap() in 2.2+ (and it's gone entirely in
+    pandas 3.x) in favor of Styler.map(). We try the new API first and
+    fall back to the old one so this keeps working regardless of which
+    pandas version is installed (e.g. on Streamlit Cloud vs. locally).
+    """
+    def highlight_signal(val):
+        colors = {"Bullish": "background-color:#d4f7dc",
+                  "Bearish": "background-color:#fbdada",
+                  "Mixed": "background-color:#f0f0f0",
+                  "No data": "background-color:#fff3cd"}
+        return colors.get(val, "")
+
+    styler = df.style
+    if hasattr(styler, "map"):
+        return styler.map(highlight_signal, subset=["Signal"])
+    return styler.applymap(highlight_signal, subset=["Signal"])
+
+
 if st.session_state.results is None:
     st.info("👈 Click **Run Live Scan Now** (or enable Auto-refresh) in the sidebar to pull live NSE data.")
 else:
@@ -204,20 +225,26 @@ else:
     c3.metric("⚪ Mixed", len(mixed))
     c4.metric("⚠️ No data", len(nodata))
 
+    if len(nodata) == len(results):
+        st.error(
+            "All 50 symbols came back with **No data**. This isn't the styling bug — "
+            "it means `fetch_live_quote` / `fetch_intraday_series` in `nse_data.py` "
+            "returned `None` for every symbol. Common causes: NSE blocked/rate-limited "
+            "this server's IP (very common on Streamlit Community Cloud, since NSE's "
+            "anti-bot checks often block cloud/datacenter IP ranges), the session's "
+            "cookies weren't set up correctly (NSE requires visiting the homepage first "
+            "to get cookies before hitting the API endpoints), or NSE changed its "
+            "endpoint/response shape. Check the 'Manage app' logs for the actual "
+            "exception being swallowed inside `fetch_live_quote`/`fetch_intraday_series`."
+        )
+
     tab_summary, tab_bull, tab_bear, tab_all = st.tabs(
         ["📋 Summary Table", "🟢 Bullish Charts", "🔴 Bearish Charts", "📊 All Charts"]
     )
 
     with tab_summary:
-        def highlight_signal(val):
-            colors = {"Bullish": "background-color:#d4f7dc",
-                      "Bearish": "background-color:#fbdada",
-                      "Mixed": "background-color:#f0f0f0",
-                      "No data": "background-color:#fff3cd"}
-            return colors.get(val, "")
-
         st.dataframe(
-            results.style.applymap(highlight_signal, subset=["Signal"]),
+            style_results(results),
             use_container_width=True,
             hide_index=True,
         )
